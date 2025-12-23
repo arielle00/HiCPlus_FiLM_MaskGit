@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+import argparse
+import sys
+from hicplus import pred_chromosome, train_models, pred_genome
+
+def getargs():
+    """
+    Top-level CLI for HiCPlus training & prediction.
+    Subcommands:
+      - train
+      - pred_chromosome
+      - pred_genome
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train CNN/FiLM models with Hi-C data and predict high-resolution maps "
+            "from low-resolution inputs."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    subparsers = parser.add_subparsers(dest="subcommands")
+
+    # -------------------
+    # train
+    # -------------------
+    subtrain = subparsers.add_parser(
+        "train",
+        help="Train a model per chromosome",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    subtrain.set_defaults(func=train_models.main)
+
+    # Required/legacy training args
+    subtrain.add_argument(
+        "-i", "--inputfile", type=str,
+        help="Path to a .hic file."
+    )
+    subtrain.add_argument(
+        "-r", "--scalerate", type=int, default=16,
+        help="Downsampling rate to generate the low-resolution training file."
+    )
+    subtrain.add_argument(
+        "-c", "--chromosome", type=int, default=21,
+        help="Chromosome index to train on."
+    )
+    subtrain.add_argument(
+        "-o", "--outmodel", type=str, default="model",
+        help="Output model checkpoint path."
+    )
+    subtrain.add_argument(
+        "-l", "--log", type=str, default="train_log",
+        help="Output log file."
+    )
+
+    # Model choice
+    subtrain.add_argument(
+        "--arch", default="hicplus", choices=["hicplus", "film"],
+        help="Model architecture: vanilla HiCPlus or FiLM-ResNet."
+    )
+    subtrain.add_argument(
+        "--width", type=int, default=64,
+        help="FiLM width (ignored for hicplus)."
+    )
+    subtrain.add_argument(
+        "--depth", type=int, default=8,
+        help="Number of FiLM residual blocks (ignored for hicplus)."
+    )
+    subtrain.add_argument(
+        "--no-aux", action="store_true",
+        help="Disable FiLM distance-map auxiliary channel (ignored for hicplus)."
+    )
+
+    # Training knobs
+    subtrain.add_argument(
+        "--space", choices=["counts", "log1p"], default="log1p",
+        help="Training space for inputs/targets."
+    )
+    subtrain.add_argument(
+        "--optimizer", choices=["adamw", "sgd"], default="adamw",
+        help="Optimizer to use."
+    )
+    subtrain.add_argument(
+        "--lr", type=float, default=2e-3,
+        help="Learning rate."
+    )
+    subtrain.add_argument(
+        "--weight-decay", type=float, default=1e-4,
+        help="Weight decay."
+    )
+    subtrain.add_argument(
+        "--epochs", type=int, default=3500,
+        help="Maximum epochs (early stopping may end sooner)."
+    )
+    subtrain.add_argument(
+        "--batch-size", type=int, default=64,
+        help="Batch size."
+    )
+    subtrain.add_argument(
+        "--accum-steps", type=int, default=1,
+        help="Gradient accumulation steps."
+    )
+    subtrain.add_argument(
+        "--no-amp", action="store_true",
+        help="Disable mixed precision (AMP)."
+    )
+    subtrain.add_argument(
+        "--log-every", type=int, default=50,
+        help="Iterations between intra-epoch log prints."
+    )
+    subtrain.add_argument(
+        "--patience", type=int, default=200,
+        help="Early stopping patience in epochs."
+    )
+
+    # -------------------
+    # pred_chromosome
+    # -------------------
+    subchrom = subparsers.add_parser(
+        "pred_chromosome",
+        help="Predict high-resolution interaction frequencies for (intra/inter) chromosomes",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    subchrom.set_defaults(func=pred_chromosome.main)
+
+    subchrom.add_argument("-i", "--inputfile", type=str, help="Path to a .hic file.")
+    subchrom.add_argument("-o", "--outputfile", type=str, help="Path to an output file.")
+    subchrom.add_argument("-m", "--model", type=str, help="Path to a model checkpoint.")
+    subchrom.add_argument(
+        "-b", "--binsize", type=int, default=10000,
+        help="Predicted resolution (e.g., 10000 for 10kb, 25000 for 25kb)."
+    )
+    subchrom.add_argument(
+        "-c", "--chrN", nargs=2, metavar=("chrN1", "chrN2"), type=str, required=True,
+        help="Chromosome numbers."
+    )
+
+    # Allow rebuilding the right architecture before loading weights
+    subchrom.add_argument(
+        "--arch", default="hicplus", choices=["hicplus", "film"],
+        help="Architecture to instantiate prior to loading weights."
+    )
+    subchrom.add_argument("--width", type=int, default=64, help="FiLM width (ignored for hicplus).")
+    subchrom.add_argument("--depth", type=int, default=8, help="FiLM blocks (ignored for hicplus).")
+    subchrom.add_argument("--no-aux", action="store_true", help="Disable FiLM aux (ignored for hicplus).")
+    subchrom.add_argument("--space", choices=["counts", "log1p"],
+                      help="Override training space if the checkpoint doesn't store it.")
+
+    # Runtime / stitching controls
+    subchrom.add_argument("--stride", type=int, default=1,
+                        help="Sliding-window stride (1 = smoothest, slower).")
+    subchrom.add_argument("--pred-batch", type=int, default=512,
+                        help="Prediction micro-batch size.")
+    subchrom.add_argument("--no-sym", action="store_true",
+                        help="Disable symmetry enforcement on the output map.")
+
+    # Optional input normalization overrides (if you need to deviate from training)
+    subchrom.add_argument("--in-scale", type=float, default=None,
+                        help="Multiply LR counts by this factor before feeding the net (None = use code default).")
+    subchrom.add_argument("--clip-max", type=float, default=None,
+                        help="Clip LR counts to this max before feeding the net (None = use code default).")
+
+    # -------------------
+    # pred_genome
+    # -------------------
+    subgen = subparsers.add_parser(
+        "pred_genome",
+        help="Predict high-resolution interaction frequencies for the genome",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    subgen.set_defaults(func=pred_genome.main)
+
+    subgen.add_argument("-i", "--inputfile", type=str, help="Path to a .hic file.")
+    subgen.add_argument("-m", "--model", type=str, help="Path to a model checkpoint.")
+    subgen.add_argument(
+        "-b", "--binsize", type=int, default=10000,
+        help="Predicted resolution (e.g., 10000 for 10kb, 25000 for 25kb)."
+    )
+
+    # Arch hints for genome prediction as well
+    subgen.add_argument(
+        "--arch", default="hicplus", choices=["hicplus", "film"],
+        help="Architecture to instantiate prior to loading weights."
+    )
+    subgen.add_argument("--width", type=int, default=64, help="FiLM width (ignored for hicplus).")
+    subgen.add_argument("--depth", type=int, default=8, help="FiLM blocks (ignored for hicplus).")
+    subgen.add_argument("--no-aux", action="store_true", help="Disable FiLM aux (ignored for hicplus).")
+
+    # -------------------
+    # Parse
+    # -------------------
+    commands = sys.argv[1:]
+    if ((not commands) or ((commands[0] in ["train", "pred_chromosome", "pred_genome"])
+                           and len(commands) == 1)):
+        commands.append("-h")
+    args = parser.parse_args(commands)
+    return args, commands
+
+
+def run():
+    args, commands = getargs()
+    print(args)
+    if commands[0] not in ["-h", "--help"]:
+        args.func(args)
+
+
+if __name__ == "__main__":
+    run()

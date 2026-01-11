@@ -29,7 +29,58 @@ SEQ_LEN = TOKEN_H * TOKEN_W
 CODEBOOK_SIZE = 4096
 
 # ======================================================
-# LOAD VQGAN (LFQ SAFE)
+# helper: attach VQ codebook so decode_from_ids works
+# ======================================================
+
+def attach_vq_codebook_if_needed(vae: VQGanVAE):
+    """
+    Your repo's VQGanVAE.decode_from_ids() expects `vae.codebook` when
+    lookup_free_quantization=False, but VQGanVAE.__init__ does not set it.
+
+    We attach it from the quantizer so decode_from_ids works WITHOUT changing the library.
+    """
+    if getattr(vae, "lookup_free_quantization", True):
+        return  # LFQ path doesn't need codebook
+
+    if hasattr(vae, "codebook"):
+        return
+
+    q = getattr(vae, "quantizer", None)
+    if q is None:
+        raise AttributeError("VAE has no .quantizer; cannot attach codebook.")
+
+    # Most common in vector_quantize_pytorch: q._codebook is an nn.Embedding or similar
+    candidates = []
+    if hasattr(q, "_codebook"):
+        candidates.append(q._codebook)
+    if hasattr(q, "codebook"):
+        candidates.append(q.codebook)
+    if hasattr(q, "embedding"):
+        candidates.append(q.embedding)
+
+    codebook = None
+    for cb in candidates:
+        if cb is None:
+            continue
+        # nn.Embedding or similar
+        if hasattr(cb, "weight") and torch.is_tensor(cb.weight):
+            codebook = cb.weight
+            break
+        # tensor-like
+        if torch.is_tensor(cb):
+            codebook = cb
+            break
+
+    if codebook is None:
+        raise AttributeError(
+            "Could not find codebook on vae.quantizer. "
+            "Print dir(vae.quantizer) and tell me what attributes it has."
+        )
+
+    vae.codebook = codebook  # <- what decode_from_ids expects
+
+# ======================================================
+# LOAD VQGAN (MUST match training)
 # ======================================================
 
 vae = VQGanVAE(
@@ -37,7 +88,15 @@ vae = VQGanVAE(
     channels=1,
     layers=2,
     codebook_size=CODEBOOK_SIZE,
+    lookup_free_quantization=False,   # MUST match training
     use_vgg_and_gan=False,
+    vq_kwargs=dict(
+        codebook_dim=64,
+        decay=0.95,
+        commitment_weight=1.0,
+        kmeans_init=True,
+        use_cosine_sim=True,
+    ),
 ).to(DEVICE)
 
 ckpt = torch.load(VQGAN_CKPT, map_location=DEVICE)
@@ -50,6 +109,9 @@ print("[VQGAN] Unexpected keys:", unexpected)
 vae.eval()
 for p in vae.parameters():
     p.requires_grad = False
+
+# ✅ patch so decode_from_ids won't crash in VQ mode
+attach_vq_codebook_if_needed(vae)
 
 # sanity check
 with torch.no_grad():
@@ -92,7 +154,7 @@ print("[MaskGit] Unexpected keys:", unexpected)
 maskgit.eval()
 
 # ======================================================
-# FIXED GENERATE (PATCH)
+# FIXED GENERATE (PATCH)  (unconditional)
 # ======================================================
 
 @torch.no_grad()
@@ -121,10 +183,7 @@ def fixed_generate(model, batch_size, timesteps=12, temperature=1.0):
         probs = F.softmax(logits / temperature, dim=-1)
 
         B, N, V = probs.shape
-        sampled = torch.multinomial(
-            probs.view(B * N, V),
-            1
-        ).view(B, N)
+        sampled = torch.multinomial(probs.view(B * N, V), 1).view(B, N)
 
         is_mask = ids == model.transformer.mask_id
         ids = torch.where(is_mask, sampled, ids)

@@ -41,8 +41,8 @@ def getargs():
         help="Downsampling rate to generate the low-resolution training file."
     )
     subtrain.add_argument(
-        "-c", "--chromosome", type=int, default=21,
-        help="Chromosome index to train on."
+        "-c", "--chromosome", nargs='+', type=int, default=[21], metavar='CHR',
+        help="Chromosome index(es) to train on. Can specify multiple (e.g., -c 1 2 3 or -c 19 21)."
     )
     subtrain.add_argument(
         "-o", "--outmodel", type=str, default="model",

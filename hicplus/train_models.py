@@ -25,20 +25,49 @@ chrs_length = [249250621,243199373,198022430,191154276,180915260,171115067,15913
 #scale = 16
 
 def main(args):
+    # Handle both single chromosome (backward compatibility) and multiple chromosomes
+    if isinstance(args.chromosome, int):
+        chromosomes = [args.chromosome]
+    else:
+        chromosomes = args.chromosome
+    
+    print(f'[INFO] Training on chromosomes: {chromosomes}')
+    
+    # Extract and concatenate data from all chromosomes
+    highres_list = []
+    lowres_list = []
+    MAX_PER_CHR = 50000
+    
+    for chr_num in chromosomes:
+        print(f'[INFO] Processing chromosome {chr_num}...')
+        highres = utils.train_matrix_extract(chr_num, 10000, args.inputfile)
+        
+        print(f'  Dividing, filtering chromosome {chr_num}...')
+        highres_sub, index = utils.train_divide(highres)
+        print(f'  Chromosome {chr_num} HR shape: {highres_sub.shape}')
+        
+        lowres = utils.genDownsample(highres, 1/float(args.scalerate))
+        lowres_sub, index = utils.train_divide(lowres)
+        print(f'  Chromosome {chr_num} LR shape: {lowres_sub.shape}')
+        
+        n = highres_sub.shape[0]
+        if n > MAX_PER_CHR:
+            idx = np.random.choice(n, MAX_PER_CHR, replace=False)
+            highres_sub = highres_sub[idx]
+            lowres_sub  = lowres_sub[idx]
+            print(f'  Subsampled chromosome {chr_num}: {n} -> {MAX_PER_CHR}')
 
-    highres = utils.train_matrix_extract(args.chromosome, 10000, args.inputfile)
 
-    print('dividing, filtering and downsampling files...')
-
-    highres_sub, index = utils.train_divide(highres)
-
-    print(highres_sub.shape)
-    #np.save(infile+"highres",highres_sub)
-
-    lowres = utils.genDownsample(highres,1/float(args.scalerate))
-    lowres_sub,index = utils.train_divide(lowres)
-    print(lowres_sub.shape)
-    #np.save(infile+"lowres",lowres_sub)
+        highres_list.append(highres_sub)
+        lowres_list.append(lowres_sub)
+    
+    # Concatenate all chromosomes
+    print('Concatenating data from all chromosomes...')
+    highres_sub = np.concatenate(highres_list, axis=0)
+    lowres_sub = np.concatenate(lowres_list, axis=0)
+    
+    print(f'Final HR shape: {highres_sub.shape}')
+    print(f'Final LR shape: {lowres_sub.shape}')
 
     print('start training...')
     print("----------------------------------",args.outmodel)

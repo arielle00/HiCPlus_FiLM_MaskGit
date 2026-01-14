@@ -4,9 +4,8 @@ os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ["BEARTYPE_IS_BEARTYPE"] = "0"
 
 import torch
-import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader, random_split, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 from muse_maskgit_pytorch.muse_maskgit_pytorch import MaskGit, Transformer
@@ -14,38 +13,58 @@ from muse_maskgit_pytorch.vqgan_vae import VQGanVAE
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+HR_PATH = "/home/012002744/hicplus_thesis/maskgit/hic_vqgan_train_hr.npy"
+LR_PATH = "/home/012002744/hicplus_thesis/maskgit/hic_vqgan_train_lr.npy"
+
 # -------------------------
-# LR corruption (define what "low-res" means)
+# Dataset: HR+LR paired from disk (no on-the-fly thinning)
 # -------------------------
-def make_lr(hr: torch.Tensor, down: int = 2) -> torch.Tensor:
-    """
-    hr: [1,H,W] or [B,1,H,W]
-    returns: LR-like degraded version at same shape
-    """
-    if hr.dim() == 3:
-        hr = hr.unsqueeze(0)
+class HiCCondPairedDataset(Dataset):
+    def __init__(self, hr_path: str, lr_path: str, dtype=torch.float32):
+        hr = np.load(hr_path)  # expected [N,1,H,W]
+        lr = np.load(lr_path)  # expected [N,1,H,W]
 
-    # downsample -> upsample (removes high-frequency detail)
-    lr = F.avg_pool2d(hr, kernel_size=down, stride=down)
-    lr = F.interpolate(lr, size=hr.shape[-2:], mode="bilinear", align_corners=False)
+        if hr.shape != lr.shape:
+            raise ValueError(f"HR and LR shapes must match. HR={hr.shape}, LR={lr.shape}")
+        if hr.ndim != 4 or hr.shape[1] != 1:
+            raise ValueError(f"Expected shape [N,1,H,W]. Got {hr.shape}")
 
-    return lr.squeeze(0) if lr.shape[0] == 1 else lr
-
-class HiCCondDataset(Dataset):
-    def __init__(self, hr_tensor: torch.Tensor, down: int = 2):
-        self.hr = hr_tensor
-        self.down = down
+        self.hr = torch.from_numpy(hr).to(dtype)
+        self.lr = torch.from_numpy(lr).to(dtype)
 
     def __len__(self):
         return self.hr.shape[0]
 
     def __getitem__(self, idx):
-        hr = self.hr[idx]          # [1,128,128]
-        lr = make_lr(hr, self.down)
-        return hr, lr
+        return self.hr[idx], self.lr[idx]
+
+
+dataset = HiCCondPairedDataset(HR_PATH, LR_PATH)
+
+# Split into train / val with aligned indices
+N = len(dataset)
+train_size = int(0.95 * N)
+val_size = N - train_size
+
+g = torch.Generator().manual_seed(42)
+perm = torch.randperm(N, generator=g).tolist()
+
+train_idx = perm[:train_size]
+val_idx   = perm[train_size:]
+
+train_data = Subset(dataset, train_idx)
+val_data   = Subset(dataset, val_idx)
+
+train_loader = DataLoader(train_data, batch_size=16, shuffle=True, drop_last=True)
+val_loader   = DataLoader(val_data,   batch_size=16, shuffle=False, drop_last=False)
+
+print(f"[INFO] Total samples: {N}")
+print(f"[INFO] Training on {train_size} samples, validating on {val_size} samples")
+print(f"[INFO] HR file: {HR_PATH}")
+print(f"[INFO] LR file: {LR_PATH}")
 
 # -------------------------
-# Load frozen VQGAN
+# Load frozen VQGAN (MUST match training)
 # -------------------------
 vae = VQGanVAE(
     dim=256,
@@ -69,41 +88,20 @@ for p in vae.parameters():
     p.requires_grad = False
 
 # -------------------------
-# Dataset (HR only on disk; LR generated on-the-fly)
-# -------------------------
-data = np.load("hic_vqgan_train.npy")   # [N, 1, 128, 128]
-data = torch.from_numpy(data).float()
-
-dataset = HiCCondDataset(data, down=2)  # tune down=2/4 depending on how "low-res" you want
-
-# Split into train and validation (5% validation)
-train_size = int(0.95 * len(dataset))
-val_size = len(dataset) - train_size
-train_data, val_data = random_split(
-    dataset,
-    [train_size, val_size],
-    generator=torch.Generator().manual_seed(42),
-)
-
-train_loader = DataLoader(train_data, batch_size=16, shuffle=True, drop_last=True)
-val_loader   = DataLoader(val_data,   batch_size=16, shuffle=False, drop_last=False)
-
-# -------------------------
 # Infer seq_len from VAE (DON'T hardcode 1024)
 # -------------------------
 with torch.no_grad():
-    hr0, lr0 = dataset[0]
-    hr0 = hr0.unsqueeze(0).to(DEVICE)  # [1,1,128,128]
+    hr0, _ = dataset[0]
+    hr0 = hr0.unsqueeze(0).to(DEVICE)  # [1,1,H,W]
     _, ids0, _ = vae.encode(hr0)
     token_h, token_w = ids0.shape[1:]
     seq_len = token_h * token_w
 
-print(f"[INFO] Token grid: {token_h} x {token_w}  => seq_len={seq_len}")
+print(f"[INFO] Token grid: {token_h} x {token_w} => seq_len={seq_len}")
 print(f"[INFO] codebook_size={vae.codebook_size}")
-print(f"[INFO] Training on {train_size} samples, validating on {val_size} samples")
 
 # -------------------------
-# Transformer (same class, now supports conditioning because you modified base code)
+# Transformer (conditioning handled inside your modified MaskGit forward)
 # -------------------------
 transformer = Transformer(
     num_tokens=vae.codebook_size,
@@ -146,9 +144,6 @@ for epoch in range(50):
         hr = hr.to(DEVICE)
         lr = lr.to(DEVICE)
 
-        # IMPORTANT: conditional call
-        # If your modified MaskGit signature is forward(self, hr_images, lr_images=None),
-        # this should work:
         loss = maskgit(hr, lr_images=lr)
 
         optimizer.zero_grad(set_to_none=True)
@@ -158,7 +153,6 @@ for epoch in range(50):
         step += 1
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Evaluate validation loss periodically
         if step % eval_every == 0:
             maskgit.eval()
             val_losses = []
@@ -177,7 +171,6 @@ for epoch in range(50):
                 prev_best_step = last_improvement_step
                 best_val_loss = avg_val_loss
                 last_improvement_step = step
-
                 torch.save(maskgit.state_dict(), "maskgit_cond.best.pt")
 
                 if prev_best < float("inf"):
@@ -189,11 +182,10 @@ for epoch in range(50):
                 print(f"\n[Step {step}] Val Loss: {avg_val_loss:.6f} "
                       f"(Best: {best_val_loss:.6f} at step {last_improvement_step})")
 
-                if last_improvement_step > 0:
-                    if (step - last_improvement_step) >= early_stopping_patience:
-                        print(f"\n[Step {step}] Early stopping: no improvement for "
-                              f"{step - last_improvement_step} steps.")
-                        stop = True
+                if last_improvement_step > 0 and (step - last_improvement_step) >= early_stopping_patience:
+                    print(f"\n[Step {step}] Early stopping: no improvement for "
+                          f"{step - last_improvement_step} steps.")
+                    stop = True
 
             pbar.set_postfix(
                 train_loss=f"{loss.item():.4f}",
@@ -207,7 +199,7 @@ for epoch in range(50):
     if stop:
         break
 
-torch.save(maskgit.state_dict(), "maskgit_cond.pt")
+torch.save(maskgit.state_dict(), "maskgit_cond_new.pt")
 
 print("\n" + "=" * 80)
 print("TRAINING SUMMARY - Best Model:")

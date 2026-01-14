@@ -1,81 +1,101 @@
 #!/usr/bin/env python3
-import sys, math, numpy as np, pandas as pd, h5py, cooler
+import sys
+import numpy as np
+import pandas as pd
+import h5py
+import cooler
 
 """
 Usage:
-  python3 thin_cool_compat.py input.cool 0.0625 downsampled.cool [chunk_size]
+  python highres_lowres.py input.cool frac output.cool [chunk_size]
 
-- Works with old cooler versions that don't support chunksize in c.pixels()
-- Also accepts URIs like file.mcool::resolutions/10000
+Also supports:
+  file.mcool::resolutions/10000
 """
 
+# -----------------------------
+# Args
+# -----------------------------
 if len(sys.argv) < 4:
-    print("Usage: python3 thin_cool_compat.py input.cool frac out.cool [chunk_size]")
+    print("Usage: python highres_lowres.py input.cool frac output.cool [chunk_size]")
     sys.exit(1)
 
 in_uri = sys.argv[1]
 frac = float(sys.argv[2])
 out_cool = sys.argv[3]
-chunk_size = int(sys.argv[4]) if len(sys.argv) > 4 else 5000000
+chunk_size = int(sys.argv[4]) if len(sys.argv) > 4 else 5_000_000
 
+if not (0.0 < frac <= 1.0):
+    raise ValueError("frac must be in (0, 1]")
 
+# -----------------------------
+# Load bins
+# -----------------------------
 c = cooler.Cooler(in_uri)
 bins = c.bins()[["chrom", "start", "end"]][:]
 
-
+# Parse mcool URI
 if "::" in in_uri:
     file_path, grp_path = in_uri.split("::", 1)
 else:
     file_path, grp_path = in_uri, "/"
 
+# -----------------------------
+# Pixel iterators
+# -----------------------------
 def iter_pixels_modern():
-
     for df in c.pixels(chunksize=chunk_size):
-        yield df[["bin1_id","bin2_id","count"]].copy()
+        yield df[["bin1_id", "bin2_id", "count"]].copy()
 
 def iter_pixels_h5():
-
     with h5py.File(file_path, "r") as f:
         grp = f[grp_path]
         p = grp["pixels"]
         n = p["bin1_id"].shape[0]
+
         for start in range(0, n, chunk_size):
             end = min(n, start + chunk_size)
-            df = pd.DataFrame({
+            yield pd.DataFrame({
                 "bin1_id": p["bin1_id"][start:end],
                 "bin2_id": p["bin2_id"][start:end],
                 "count":   p["count"][start:end]
             })
-            yield df
 
+# -----------------------------
+# Thinning generator
+# -----------------------------
 def thinned_pixel_gen():
+    rng = np.random.default_rng()
 
-    use_h5 = False
+    # Try modern API, fallback to HDF5
     try:
         iterator = iter_pixels_modern()
-
         first = next(iterator)
     except Exception:
-        use_h5 = True
-
-    if use_h5:
         iterator = iter_pixels_h5()
         first = next(iterator, None)
 
-    rng = np.random.default_rng()
-
-    def thin_counts(df):
+    def thin_and_dedup(df):
         cnt = df["count"].to_numpy(dtype=np.int64, copy=False)
         df = df.copy()
         df["count"] = rng.binomial(cnt, frac).astype(np.int32)
-        return df[df["count"] > 0]
+        df = df[df["count"] > 0]
+
+        # REQUIRED: collapse duplicate pixels
+        return (
+            df.groupby(["bin1_id", "bin2_id"], as_index=False, sort=False)
+              .agg({"count": "sum"})
+        )
 
     if first is not None:
-        yield thin_counts(first)
+        yield thin_and_dedup(first)
 
     for df in iterator:
-        yield thin_counts(df)
+        yield thin_and_dedup(df)
 
+# -----------------------------
+# Write cooler
+# -----------------------------
 cooler.create_cooler(
     out_cool,
     bins=bins,

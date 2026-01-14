@@ -8,3 +8,5 @@ cooler load -f bg2 ${chrom}:10000 ${dat} ${dat}.cool --input-copy-status duplex
 # cooler load -f bg2 chrom_hg38.sizes:10000 test_19_20_0hmodel_4DNFI1UEG1HD_pred.out.txt test_19_20_0hmodel_4DNFI1UEG1HD_pred.10k.cool
 ## remove the intermediate tmp file. 
 # rm ${dat}_tmp
+
+# sh mat2cool.sh /home/012002744/hicplus_thesis/pred_chr20.txt

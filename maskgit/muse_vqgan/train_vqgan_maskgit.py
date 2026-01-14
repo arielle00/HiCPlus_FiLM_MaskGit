@@ -23,7 +23,7 @@ from muse_maskgit_pytorch.trainers import VQGanVAETrainer
 # config
 # ------------------------------------------------
 
-HIGHRES_NPY = "/home/012002744/hicplus_thesis/maskgit/hic_vqgan_train.npy"
+HIGHRES_NPY = "/home/012002744/hicplus_thesis/maskgit/hic_vqgan_train_hr.npy"
 RESULTS_DIR = "./vqgan_results_2layers_4096"
 
 BATCH_SIZE = 4

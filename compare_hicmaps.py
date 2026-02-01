@@ -1,11 +1,14 @@
 #!/usr/bin/env python
 # compare_hicmaps.py  (Py3.6-friendly)
 #
-# Changes vs your version:
-# - Adds --pred_scale to scale prediction in-memory (no need to rebuild .cool)
-# - Uses shared vmin/vmax (based on ref percentile) for fair visual comparison
+# Features:
+# - --pred_scale: scale prediction in-memory
+# - --mass_calibrate_pred: rescale pred to match ref total mass (counts) over region
+#     - --mass_calibrate_mode global|per_row
+#     - --alpha_min / --alpha_max clamps
+# - Shared vmin/vmax (based on ref log1p percentile) for fair visual comparison
 # - Plots REF / LOW / PRED heatmaps + correlation-vs-distance in a 1x4 figure
-# - Prints means/sums for counts + log1p (helps diagnose global bias)
+# - Prints means/sums for counts + log1p
 
 import argparse
 import numpy as np
@@ -50,10 +53,13 @@ def fetch_square(c, chrom, start, end):
 
 def overall_metrics(A, B):
     """Compute Pearson, Spearman, MSE, SSIM on log1p matrices."""
-    a = np.log1p(A); b = np.log1p(B)
-    af = a.ravel(); bf = b.ravel()
+    a = np.log1p(A)
+    b = np.log1p(B)
+    af = a.ravel()
+    bf = b.ravel()
     m = np.isfinite(af) & np.isfinite(bf)
-    af = af[m]; bf = bf[m]
+    af = af[m]
+    bf = bf[m]
     if af.size == 0 or np.std(af) == 0 or np.std(bf) == 0:
         return np.nan, np.nan, np.nan, np.nan
     pr = pearsonr(af, bf)[0]
@@ -65,16 +71,19 @@ def overall_metrics(A, B):
 
 def corr_vs_distance(A, B, binsize, max_kbins=200, min_pts=25):
     """Pearson & Spearman along diagonals (distance-stratified)."""
-    a = np.log1p(A); b = np.log1p(B)
+    a = np.log1p(A)
+    b = np.log1p(B)
     n = min(a.shape)
     max_k = min(max_kbins, n - 1)
     dists, pears, spears = [], [], []
     for d in range(1, max_k):
-        t = np.diag(a, k=d); p = np.diag(b, k=d)
+        t = np.diag(a, k=d)
+        p = np.diag(b, k=d)
         m = np.isfinite(t) & np.isfinite(p)
-        t = t[m]; p = p[m]
+        t = t[m]
+        p = p[m]
         if t.size >= min_pts and np.std(t) > 0 and np.std(p) > 0:
-            dists.append(d * binsize / 1000.0)           # kb
+            dists.append(d * binsize / 1000.0)  # kb
             pears.append(pearsonr(t, p)[0])
             spears.append(spearmanr(t, p)[0])
     return np.array(dists), np.array(pears), np.array(spears)
@@ -99,9 +108,20 @@ def main():
 
     ap.add_argument("--out",  default="compare_chr_metrics.png", help="Output figure")
 
-    # NEW: scale prediction in-memory (avoids rebuilding .cool)
+    # Scale prediction in-memory (avoids rebuilding .cool)
     ap.add_argument("--pred_scale", type=float, default=1.0,
                     help="Multiply predicted counts by this factor before metrics/plots.")
+
+    # NEW: auto-rescale pred to match ref total counts in the evaluated region
+    ap.add_argument("--mass_calibrate_pred", action="store_true",
+                    help="Rescale pred counts so sum(pred) matches sum(ref) over the region.")
+    ap.add_argument("--mass_calibrate_mode", type=str, default="global",
+                    choices=["global", "per_row"],
+                    help="global: one alpha for whole region. per_row: match row-sums (can reduce off-diag redness).")
+    ap.add_argument("--alpha_min", type=float, default=0.0,
+                    help="Clamp alpha to >= alpha_min.")
+    ap.add_argument("--alpha_max", type=float, default=10.0,
+                    help="Clamp alpha to <= alpha_max.")
 
     # Shared heatmap scale (based on ref log1p)
     ap.add_argument("--vmax_pct", type=float, default=99.5,
@@ -124,12 +144,38 @@ def main():
     mat_low  = fetch_square(clow,  args.chrom, args.start, args.end)
     mat_pred = fetch_square(cpred, args.chrom, args.start, args.end)
 
-    # Apply scaling to prediction IN-MEMORY
+    # Apply scaling to prediction IN-MEMORY (counts space)
     if args.pred_scale != 1.0:
         mat_pred = mat_pred * float(args.pred_scale)
 
     n = min(mat_ref.shape[0], mat_low.shape[0], mat_pred.shape[0])
     mat_ref, mat_low, mat_pred = mat_ref[:n, :n], mat_low[:n, :n], mat_pred[:n, :n]
+
+    # Optional: mass-calibrate pred (in COUNT space) to match ref over this region
+    alpha_used = None
+    eps = 1e-8
+    if args.mass_calibrate_pred:
+        if args.mass_calibrate_mode == "global":
+            ref_sum0  = float(mat_ref.sum())
+            pred_sum0 = float(mat_pred.sum())
+            alpha = ref_sum0 / (pred_sum0 + eps)
+            alpha = max(args.alpha_min, min(args.alpha_max, alpha))
+            mat_pred = mat_pred * alpha
+            alpha_used = alpha
+            print("[MASS_CAL] mode=global ref_sum={:.3e} pred_sum={:.3e} alpha={:.6f} pred_sum_after={:.3e}".format(
+                ref_sum0, pred_sum0, alpha, float(mat_pred.sum())
+            ))
+        else:
+            # per_row
+            ref_rs  = mat_ref.sum(axis=1, keepdims=True)
+            pred_rs = mat_pred.sum(axis=1, keepdims=True)
+            alpha_r = ref_rs / (pred_rs + eps)
+            alpha_r = np.clip(alpha_r, args.alpha_min, args.alpha_max)
+            mat_pred = mat_pred * alpha_r
+            alpha_used = alpha_r  # array
+            print("[MASS_CAL] mode=per_row alpha stats: min={:.6f} median={:.6f} max={:.6f}".format(
+                float(alpha_r.min()), float(np.median(alpha_r)), float(alpha_r.max())
+            ))
 
     chrom_nm = _norm_chrom_name(cref, args.chrom)
 
@@ -158,7 +204,7 @@ def main():
     vmin = 0.0
     finite_ref = ref_log[np.isfinite(ref_log)]
     vmax = float(np.percentile(finite_ref, args.vmax_pct)) if finite_ref.size else 1.0
-    if not np.isfinite(vmax) or vmax <= vmin:
+    if (not np.isfinite(vmax)) or vmax <= vmin:
         vmax = float(np.nanmax(ref_log)) if np.isfinite(np.nanmax(ref_log)) else 1.0
 
     im0 = axes[0].imshow(ref_log,  cmap="Reds", origin="lower", aspect="equal", vmin=vmin, vmax=vmax)
@@ -167,8 +213,13 @@ def main():
     im1 = axes[1].imshow(low_log,  cmap="Reds", origin="lower", aspect="equal", vmin=vmin, vmax=vmax)
     axes[1].set_title("Low-res")
 
+    title = "Pred (x{:.3g})".format(args.pred_scale)
+    if args.mass_calibrate_pred:
+        title += " + mass-cal"
+        if isinstance(alpha_used, float):
+            title += " (a={:.3g})".format(alpha_used)
     im2 = axes[2].imshow(pred_log, cmap="Reds", origin="lower", aspect="equal", vmin=vmin, vmax=vmax)
-    axes[2].set_title("Predicted (scaled x{:.3g})".format(args.pred_scale))
+    axes[2].set_title(title)
 
     for ax in axes[:3]:
         ax.set_xlabel("{} bins".format(chrom_nm))
@@ -201,6 +252,7 @@ def main():
              ref_lmean, low_lmean, pred_lmean,
              ref_sum, low_sum, pred_sum,
              args.vmax_pct, vmax)
+
     axes[3].text(0.01, 0.99, txt, transform=axes[3].transAxes,
                  va="top", ha="left", fontsize=8)
 
@@ -211,7 +263,6 @@ def main():
     print("=== Overall metrics [{}:{}-{}] ===".format(chrom_nm, args.start, args.end))
     print("Low  vs Ref: Pearson={:.4f} Spearman={:.4f} MSE={:.4f} SSIM={:.4f}".format(prL, srL, mseL, ssimL))
     print("Pred vs Ref: Pearson={:.4f} Spearman={:.4f} MSE={:.4f} SSIM={:.4f}".format(prP, srP, mseP, ssimP))
-
     print("Means (counts): ref={:.4f} low={:.4f} pred={:.4f}".format(ref_mean, low_mean, pred_mean))
     print("Means (log1p):  ref={:.4f} low={:.4f} pred={:.4f}".format(ref_lmean, low_lmean, pred_lmean))
     print("Sums  (counts): ref={:.2e} low={:.2e} pred={:.2e}".format(ref_sum, low_sum, pred_sum))
@@ -220,6 +271,12 @@ def main():
     with open(metrics_txt, "w") as f:
         f.write("# region {}:{}-{}\n".format(chrom_nm, args.start, args.end))
         f.write("# pred_scale {}\n".format(args.pred_scale))
+        f.write("# mass_calibrate_pred {}\n".format(args.mass_calibrate_pred))
+        f.write("# mass_calibrate_mode {}\n".format(args.mass_calibrate_mode))
+        f.write("# alpha_min {}\n".format(args.alpha_min))
+        f.write("# alpha_max {}\n".format(args.alpha_max))
+        if args.mass_calibrate_pred and isinstance(alpha_used, float):
+            f.write("# mass_calibrate_alpha {}\n".format(alpha_used))
         f.write("# heatmap_vmax_pct {}\n".format(args.vmax_pct))
         f.write("# heatmap_vmax {}\n".format(vmax))
         f.write("low_vs_ref\t{:.6f}\t{:.6f}\t{:.6f}\t{:.6f}\n".format(prL, srL, mseL, ssimL))
@@ -227,6 +284,9 @@ def main():
         f.write("means_counts\t{:.6f}\t{:.6f}\t{:.6f}\n".format(ref_mean, low_mean, pred_mean))
         f.write("means_log1p\t{:.6f}\t{:.6f}\t{:.6f}\n".format(ref_lmean, low_lmean, pred_lmean))
         f.write("sums_counts\t{:.6e}\t{:.6e}\t{:.6e}\n".format(ref_sum, low_sum, pred_sum))
+
+    print("[OK] Saved figure:", args.out)
+    print("[OK] Saved metrics:", metrics_txt)
 
 
 if __name__ == "__main__":

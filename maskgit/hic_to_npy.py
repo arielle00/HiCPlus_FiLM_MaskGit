@@ -2,7 +2,12 @@
 """
 Convert .hic → .npy tiles for VQGAN / MaskGIT training (DIAGONAL ONLY),
 and ALSO generate a *low-depth* (LR) version by binomial thinning in RAW-count space,
-then applying the SAME preprocessing (O/E by distance + log1p + filtering).
+then applying the SAME preprocessing (log1p(counts) + filtering).
+
+Note: Uses log1p(counts) normalization (matching HiCPlus+FiLM trainConvNet.py):
+    - HR: clip to 100, then log1p
+    - LR: multiply by 16, clip to 100, then log1p
+    NOT O/E normalization.
 
 Python 3.9-compatible (no PEP604 | unions, no built-in generics like tuple[...]).
 
@@ -18,6 +23,10 @@ from typing import Optional, Tuple
 import numpy as np
 import hicstraw
 from tqdm import tqdm
+
+# Normalization constants (matching hicplus/trainConvNet.py)
+DOWN_SAMPLE_RATIO = 16
+HIC_MAX_VALUE = 100
 
 
 def tile_observed_over_expected(tile: np.ndarray) -> np.ndarray:
@@ -39,10 +48,33 @@ def tile_observed_over_expected(tile: np.ndarray) -> np.ndarray:
     return out
 
 
-def preprocess_tile(raw_tile_counts: np.ndarray) -> np.ndarray:
-    """RAW counts -> O/E by distance -> log1p."""
-    x = tile_observed_over_expected(raw_tile_counts)
+def preprocess_tile(raw_tile_counts: np.ndarray, is_lr: bool = False) -> np.ndarray:
+    """
+    RAW counts -> log1p(counts) (matching HiCPlus+FiLM normalization).
+    
+    Normalization steps (matching hicplus/trainConvNet.py):
+    - For LR: multiply by DOWN_SAMPLE_RATIO, then clip to HIC_MAX_VALUE, then log1p
+    - For HR: clip to HIC_MAX_VALUE, then log1p
+    
+    Args:
+        raw_tile_counts: [H,W] raw count matrix
+        is_lr: If True, apply down_sample_ratio scaling (for LR tiles)
+    
+    Returns:
+        [H,W] float32 log1p-normalized tile
+    """
+    x = raw_tile_counts.astype(np.float32, copy=False)
+    
+    # For LR: multiply by down_sample_ratio (matching trainConvNet.py line 246)
+    if is_lr:
+        x = x * DOWN_SAMPLE_RATIO
+    
+    # Clip to stabilize (matching trainConvNet.py lines 250-251)
+    x = np.minimum(HIC_MAX_VALUE, x)
+    
+    # Apply log1p transformation (matching trainConvNet.py lines 259-260)
     x = np.log1p(x)
+    
     return x.astype(np.float32, copy=False)
 
 
@@ -123,9 +155,11 @@ def extract_tiles_diagonal_only_hr_lr(
 
         lr_raw = thin_tile_binomial_symmetric(hr_raw, frac=frac, rng=rng)
 
-        # preprocess both into the SAME representation your VQGAN/MaskGit uses
-        hr_pre = preprocess_tile(hr_raw)
-        lr_pre = preprocess_tile(lr_raw)
+        # preprocess both into log1p(counts) representation (matching HiCPlus+FiLM)
+        # HR: clip to HIC_MAX_VALUE, then log1p
+        # LR: multiply by DOWN_SAMPLE_RATIO, clip to HIC_MAX_VALUE, then log1p
+        hr_pre = preprocess_tile(hr_raw, is_lr=False)
+        lr_pre = preprocess_tile(lr_raw, is_lr=True)
 
         # compute information content (same criterion style as your original script)
         hr_nzf = (np.abs(hr_pre) > 1e-6).mean()
@@ -265,7 +299,7 @@ if __name__ == "__main__":
         "--min-nonzero-frac-hr",
         type=float,
         default=0.05,
-        help="Min nonzero fraction threshold for HR_pre tiles (abs(log1p(O/E))>1e-6).",
+        help="Min nonzero fraction threshold for HR_pre tiles (abs(log1p(counts))>1e-6).",
     )
     p.add_argument(
         "--min-nonzero-frac-lr",

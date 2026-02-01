@@ -24,7 +24,7 @@ from muse_maskgit_pytorch.trainers import VQGanVAETrainer
 # ------------------------------------------------
 
 HIGHRES_NPY = "/home/012002744/hicplus_thesis/maskgit/hic_vqgan_train_hr.npy"
-RESULTS_DIR = "./vqgan_results_2layers_4096"
+RESULTS_DIR = "./vqgan_results_2layers_4096_removedOEsignal"
 
 BATCH_SIZE = 4
 GRAD_ACCUM = 8

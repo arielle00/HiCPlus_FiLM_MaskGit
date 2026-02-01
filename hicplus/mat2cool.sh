@@ -1,5 +1,6 @@
 dat=$1 ##output from hicplus prediction
-chrom=../chrom_hg38.sizes ##chrom size file, change to your own species. 
+# Edit the script to use absolute path:
+chrom=/home/012002744/hicplus_thesis/chrom_hg38.sizes ##chrom size file, change to your own species. 
 
 # cat $dat | tr ':' '\t'|tr '-' '\t' > ${dat}_tmp
 

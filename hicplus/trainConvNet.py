@@ -81,6 +81,134 @@ def _make_loader(low_np, y_np, batch_size):
 def _maybe_amp(enabled):
     return _AMP_AVAILABLE and enabled
 
+def create_offdiag_mask(shape, band, device=None):
+    """
+    Create a mask for pixels where abs(x-y) > band (off-diagonal region).
+    
+    Args:
+        shape: Tuple of (H, W) or (C, H, W) or (B, C, H, W) - spatial dimensions
+        band: Band width - pixels with |i-j| > band are masked
+        device: torch device (optional)
+    
+    Returns:
+        Boolean mask tensor of same shape as input (True for off-diagonal pixels)
+    """
+    # Extract spatial dimensions
+    if len(shape) == 2:
+        H, W = shape
+        spatial_dims = (H, W)
+    elif len(shape) == 3:
+        _, H, W = shape
+        spatial_dims = (H, W)
+    elif len(shape) == 4:
+        _, _, H, W = shape
+        spatial_dims = (H, W)
+    else:
+        raise ValueError(f"Unsupported shape length: {len(shape)}")
+    
+    # Create coordinate grids
+    i_coords = torch.arange(H, dtype=torch.float32, device=device)
+    j_coords = torch.arange(W, dtype=torch.float32, device=device)
+    
+    # Create meshgrids
+    i_grid, j_grid = torch.meshgrid(i_coords, j_coords, indexing='ij')
+    
+    # Compute |i - j| for each pixel
+    diag_dist = torch.abs(i_grid - j_grid)
+    
+    # Mask: True where |i-j| > band (off-diagonal)
+    mask = diag_dist > band
+    
+    # Expand to match input shape if needed
+    if len(shape) == 3:
+        mask = mask.unsqueeze(0)  # Add channel dimension
+    elif len(shape) == 4:
+        mask = mask.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+    
+    return mask
+
+def weighted_mse_loss(pred_log, target_log, loss_weight_mode=None, loss_weight_k=10, lr_tau_counts=0.0, lr_batch=None):
+    """
+    Compute weighted MSE loss that emphasizes nonzero/high-evidence pixels.
+    
+    Args:
+        pred_log: Predicted values in log1p space [B, C, H, W] or [B, H, W]
+        target_log: Target values in log1p space [B, C, H, W] or [B, H, W]
+        loss_weight_mode: "hr_nonzero" or "lr_evidence" or None (plain MSE)
+        loss_weight_k: Weight multiplier for nonzero/evidence pixels (default: 10)
+        lr_tau_counts: Threshold for LR evidence mode (default: 0.0)
+        lr_batch: LR input batch for lr_evidence mode [B, C, H_lr, W_lr] (required if mode is lr_evidence)
+                  Will be center-cropped to match target spatial dimensions
+    
+    Returns:
+        Weighted MSE loss scalar
+    """
+    if loss_weight_mode is None:
+        # Plain MSE
+        return nn.functional.mse_loss(pred_log, target_log)
+    
+    # Compute squared error
+    squared_error = (pred_log - target_log) ** 2
+    
+    if loss_weight_mode == "hr_nonzero":
+        # Variant A: HR-nonzero weighted MSE in log-space
+        # Convert HR log1p back to counts: hr_counts = expm1(hr_log)
+        hr_counts = torch.expm1(target_log)
+        # Weight mask: w = 1 + k * (hr_counts > 0)
+        weight = 1.0 + loss_weight_k * (hr_counts > 0).float()
+        # Loss: mean(w * (pred_log - hr_log)^2)
+        weighted_error = weight * squared_error
+        return weighted_error.mean()
+    
+    elif loss_weight_mode == "lr_evidence":
+        # Variant B: LR-evidence weighted loss
+        if lr_batch is None:
+            raise ValueError("lr_batch is required for lr_evidence loss mode")
+        
+        # lr_batch may have different spatial dimensions than target (due to padding)
+        # Center-crop lr_batch to match target spatial dimensions
+        # Use the same padding logic as _build_targets
+        padding = conv2d1_filters_size + conv2d2_filters_size + conv2d3_filters_size - 3  # 12
+        half_padding = padding // 2  # 6
+        
+        target_shape = target_log.shape
+        lr_shape = lr_batch.shape
+        
+        # Handle different shape cases
+        if len(target_shape) == 4 and len(lr_shape) == 4:
+            # Both are 4D: [B, C, H, W]
+            if target_shape[2:] != lr_shape[2:]:
+                # Center-crop lr_batch to match target
+                _, _, H_tgt, W_tgt = target_shape
+                lr_batch_cropped = lr_batch[:, :, half_padding:half_padding+H_tgt, half_padding:half_padding+W_tgt]
+            else:
+                lr_batch_cropped = lr_batch
+        elif len(target_shape) == 3:
+            # target is 3D [B, H, W], lr is 4D [B, C, H, W]
+            H_tgt, W_tgt = target_shape[1], target_shape[2]
+            lr_batch_cropped = lr_batch[:, 0, half_padding:half_padding+H_tgt, half_padding:half_padding+W_tgt]
+        else:
+            # Fallback: try to match shapes
+            if lr_shape == target_shape:
+                lr_batch_cropped = lr_batch
+            else:
+                raise ValueError(f"Cannot align lr_batch shape {lr_shape} with target shape {target_shape}")
+        
+        # Ensure shapes match exactly
+        if lr_batch_cropped.shape != target_log.shape:
+            raise ValueError(f"After cropping, lr_batch shape {lr_batch_cropped.shape} != target shape {target_log.shape}")
+        
+        # lr_counts = expm1(lr_log)
+        lr_counts = torch.expm1(lr_batch_cropped)
+        # w = 1 + k * (lr_counts > tau)
+        weight = 1.0 + loss_weight_k * (lr_counts > lr_tau_counts).float()
+        # Same weighted MSE
+        weighted_error = weight * squared_error
+        return weighted_error.mean()
+    
+    else:
+        raise ValueError(f"Unknown loss_weight_mode: {loss_weight_mode}. Use 'hr_nonzero', 'lr_evidence', or None.")
+
 # -------------------------
 # Main training entry
 # -------------------------
@@ -95,7 +223,12 @@ def train(
     optimizer_name=DEFAULT_OPT,          # "adamw" or "sgd"
     amp=True, accum_steps=DEFAULT_ACCUM,
     log_every=DEFAULT_LOG_EVERY,
-    patience=DEFAULT_PATIENCE
+    patience=DEFAULT_PATIENCE,
+    loss_weight_mode=None,              # "hr_nonzero", "lr_evidence", or None
+    loss_weight_k=10,                   # Weight multiplier for nonzero/evidence pixels
+    lr_tau_counts=0.0,                  # Threshold for LR evidence mode
+    offdiag_band=None,                  # Band width for off-diagonal penalty (None = disabled)
+    lambda_bg=0.005                    # Weight for background penalty regularizer
 ):
     """
     Train either vanilla HiCPlus or FiLM model.
@@ -176,7 +309,20 @@ def train(
 
 
     scaler = GradScaler(enabled=_maybe_amp(amp))
-    criterion = nn.MSELoss()
+    
+    # Setup loss function
+    if loss_weight_mode is not None:
+        print(f"[INFO] Using weighted loss: mode={loss_weight_mode}, k={loss_weight_k}")
+        if loss_weight_mode == "lr_evidence":
+            print(f"       LR evidence threshold: {lr_tau_counts}")
+    else:
+        print("[INFO] Using plain MSE loss")
+    
+    # Setup off-diagonal regularizer
+    if offdiag_band is not None:
+        print(f"[INFO] Off-diagonal regularizer enabled: band={offdiag_band}, lambda_bg={lambda_bg}")
+    else:
+        print("[INFO] Off-diagonal regularizer disabled")
 
     # ---- Train loop ----
     best_loss = float("inf")
@@ -199,7 +345,62 @@ def train(
 
                 with autocast(enabled=_maybe_amp(amp)):
                     pred = Net(lr_batch)            # in log or counts space, depending on use_log1p
-                    loss = criterion(pred, y_batch)
+                    
+                    # Use weighted loss if specified, otherwise plain MSE
+                    if loss_weight_mode is not None:
+                        if loss_weight_mode == "lr_evidence":
+                            # Need to pass lr_batch for lr_evidence mode
+                            mse_loss = weighted_mse_loss(
+                                pred, y_batch,
+                                loss_weight_mode=loss_weight_mode,
+                                loss_weight_k=loss_weight_k,
+                                lr_tau_counts=lr_tau_counts,
+                                lr_batch=lr_batch
+                            )
+                        else:
+                            # hr_nonzero mode doesn't need lr_batch
+                            mse_loss = weighted_mse_loss(
+                                pred, y_batch,
+                                loss_weight_mode=loss_weight_mode,
+                                loss_weight_k=loss_weight_k,
+                                lr_tau_counts=lr_tau_counts
+                            )
+                    else:
+                        # Plain MSE
+                        mse_loss = nn.functional.mse_loss(pred, y_batch)
+                    
+                    # Add off-diagonal regularizer if enabled
+                    if offdiag_band is not None:
+                        # Build mask for pixels where abs(x-y) > band
+                        pred_shape = pred.shape
+                        offdiag_mask_base = create_offdiag_mask(pred_shape, offdiag_band, device=pred.device)
+                        
+                        # Expand mask to match pred shape exactly for boolean indexing
+                        if len(pred_shape) == 4:
+                            B, C, H, W = pred_shape
+                            # Expand [1, 1, H, W] to [B, C, H, W]
+                            offdiag_mask = offdiag_mask_base.expand(B, C, H, W)
+                        elif len(pred_shape) == 3:
+                            B, H, W = pred_shape
+                            # Expand [1, H, W] to [B, H, W]
+                            offdiag_mask = offdiag_mask_base.expand(B, H, W)
+                        else:
+                            offdiag_mask = offdiag_mask_base
+                        
+                        # Convert pred_log to counts: pred_counts = expm1(pred_log)
+                        pred_counts = torch.expm1(pred)
+                        
+                        # Penalize mean predicted counts in off-diagonal region
+                        # bg_pen = mean(pred_counts[offdiag_mask])
+                        if offdiag_mask.any():
+                            bg_pen = pred_counts[offdiag_mask].mean()
+                        else:
+                            bg_pen = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+                        
+                        # Total loss: loss = weighted_mse + lambda_bg * bg_pen
+                        loss = mse_loss + lambda_bg * bg_pen
+                    else:
+                        loss = mse_loss
 
                 scaler.scale(loss / max(1, accum_steps)).backward()
 

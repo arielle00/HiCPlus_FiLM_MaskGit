@@ -113,6 +113,44 @@ def getargs():
         help="Early stopping patience in epochs."
     )
 
+    # Data loading options (for .npy files with .coords.npy)
+    subtrain.add_argument(
+        "--lr-npy", type=str, default=None,
+        help="Path to low-resolution patches .npy file (alternative to --inputfile)."
+    )
+    subtrain.add_argument(
+        "--hr-npy", type=str, default=None,
+        help="Path to high-resolution patches .npy file (alternative to --inputfile)."
+    )
+    subtrain.add_argument(
+        "--diag-max-sep-bins", type=int, default=None,
+        help="Maximum diagonal separation (|i-j|) in bins for patch filtering. Only patches with sep <= this value will be used. Default: None (no filtering). Recommended: 512 for 128x128 tiles."
+    )
+
+    # Loss weighting options
+    subtrain.add_argument(
+        "--loss-weight-mode", type=str, default=None, choices=["hr_nonzero", "lr_evidence"],
+        help="Weighted loss mode: 'hr_nonzero' (emphasize HR nonzero pixels) or 'lr_evidence' (emphasize LR high-evidence pixels). Default: None (plain MSE)."
+    )
+    subtrain.add_argument(
+        "--loss-weight-k", type=float, default=10,
+        help="Weight multiplier for nonzero/evidence pixels in weighted loss. Default: 10. Recommended range: 5-20."
+    )
+    subtrain.add_argument(
+        "--lr-tau-counts", type=float, default=0.0,
+        help="Threshold for LR evidence mode (counts space). Only used with --loss-weight-mode lr_evidence. Default: 0.0."
+    )
+
+    # Off-diagonal regularizer options
+    subtrain.add_argument(
+        "--offdiag-band", type=int, default=None,
+        help="Band width for off-diagonal penalty regularizer. Pixels with |i-j| > band are penalized. Default: None (disabled). Recommended: 8-16 pixels."
+    )
+    subtrain.add_argument(
+        "--lambda-bg", type=float, default=0.005,
+        help="Weight for background penalty regularizer. Total loss = weighted_mse + lambda_bg * bg_pen. Default: 0.005. Recommended range: 1e-3 to 1e-2."
+    )
+
     # -------------------
     # pred_chromosome
     # -------------------
